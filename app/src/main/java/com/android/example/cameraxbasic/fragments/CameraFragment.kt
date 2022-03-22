@@ -24,6 +24,10 @@ import android.content.IntentFilter
 import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.hardware.display.DisplayManager
 import android.media.MediaScannerConnection
 import android.net.Uri
@@ -39,17 +43,19 @@ import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.camera.core.*
 import androidx.camera.core.ImageCapture.Metadata
+import androidx.camera.extensions.ExtensionMode
+import androidx.camera.extensions.ExtensionsManager
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
+import androidx.core.content.ContextCompat.getSystemService
 import androidx.core.net.toFile
 import androidx.core.view.setPadding
 import androidx.fragment.app.Fragment
+import androidx.lifecycle.asLiveData
 import androidx.lifecycle.lifecycleScope
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import androidx.navigation.Navigation
-import com.android.example.cameraxbasic.KEY_EVENT_ACTION
-import com.android.example.cameraxbasic.KEY_EVENT_EXTRA
-import com.android.example.cameraxbasic.MainActivity
+import com.android.example.cameraxbasic.*
 import com.android.example.cameraxbasic.R
 import com.android.example.cameraxbasic.databinding.CameraUiContainerBinding
 import com.android.example.cameraxbasic.databinding.FragmentCameraBinding
@@ -57,6 +63,7 @@ import com.android.example.cameraxbasic.utils.*
 import com.bumptech.glide.Glide
 import com.bumptech.glide.request.RequestOptions
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import java.io.File
 import java.nio.ByteBuffer
@@ -79,10 +86,9 @@ typealias LumaListener = (luma: Double) -> Unit
  * - Photo taking
  * - Image analysis
  */
-class CameraFragment : Fragment() {
+class CameraFragment : Fragment(), SensorEventListener {
 
     private var _fragmentCameraBinding: FragmentCameraBinding? = null
-
     private val fragmentCameraBinding get() = _fragmentCameraBinding!!
 
     private var cameraUiContainerBinding: CameraUiContainerBinding? = null
@@ -99,12 +105,15 @@ class CameraFragment : Fragment() {
     private var imageAnalyzer: ImageAnalysis? = null
     private var camera: Camera? = null
     private var cameraProvider: ProcessCameraProvider? = null
-    private lateinit var windowManager: WindowManager
 
-    private val sharedManager: SharedManager by lazy { SharedManager(requireContext())}
+    private var isAnalysis: Boolean = false
 
     private var cameraSizeWidth: Int = 1280
     private var cameraSizeHeight: Int = 720
+
+    private val sensorManager by lazy { requireContext().getSystemService(Context.SENSOR_SERVICE) as SensorManager}
+    private var mLight: Sensor? = null
+    private var lightValue: Float = 0F
 
 
     private val displayManager by lazy {
@@ -147,6 +156,10 @@ class CameraFragment : Fragment() {
         super.onResume()
         // Make sure that all permissions are still present, since the
         // user could have removed them while the app was in paused state.
+        mLight?.also { light ->
+            sensorManager.registerListener(this, light, SensorManager.SENSOR_DELAY_NORMAL)
+        }
+
         if (!PermissionsFragment.hasPermissions(requireContext())) {
             Navigation.findNavController(requireActivity(), R.id.fragment_container).navigate(
                     CameraFragmentDirections.actionCameraToPermissions()
@@ -157,6 +170,7 @@ class CameraFragment : Fragment() {
     override fun onDestroyView() {
         _fragmentCameraBinding = null
         super.onDestroyView()
+        sensorManager.unregisterListener(this)
 
         // Shut down our background executor
         cameraExecutor.shutdown()
@@ -227,6 +241,9 @@ class CameraFragment : Fragment() {
             // Set up the camera and its use cases
             setUpCamera()
         }
+
+        mLight = sensorManager.getDefaultSensor(Sensor.TYPE_LIGHT)
+
     }
 
     /**
@@ -311,7 +328,8 @@ class CameraFragment : Fragment() {
                 .build()
 
         // ImageAnalysis
-        imageAnalyzer = ImageAnalysis.Builder()
+        if (isAnalysis) {
+            imageAnalyzer = ImageAnalysis.Builder()
                 .setTargetResolution(Size(cameraSizeWidth, cameraSizeHeight))
                 // We request aspect ratio but no resolution
 //                .setTargetAspectRatio(screenAspectRatio)
@@ -325,9 +343,12 @@ class CameraFragment : Fragment() {
                         // Values returned from our analyzer are passed to the attached listener
                         // We log image analysis results here - you should do something useful
                         // instead!
-                        Log.d(TAG, "Average luminosity: $luma")
+//                        Log.d(TAG, "Average luminosity: $luma")
                     })
                 }
+        }
+
+
 
         // Must unbind the use-cases before rebinding them
         cameraProvider.unbindAll()
@@ -336,7 +357,12 @@ class CameraFragment : Fragment() {
             // A variable number of use-cases can be passed here -
             // camera provides access to CameraControl & CameraInfo
             camera = cameraProvider.bindToLifecycle(
-                    this, cameraSelector, preview, imageCapture, imageAnalyzer)
+                    this,
+                cameraSelector,
+                preview,
+                imageCapture,
+//                imageAnalyzer
+            )
 
             // Attach the viewfinder's surface provider to preview use case
             preview?.setSurfaceProvider(fragmentCameraBinding.viewFinder.surfaceProvider)
@@ -486,7 +512,7 @@ class CameraFragment : Fragment() {
             imageCapture?.let { imageCapture ->
 
                 // Create output file to hold the image
-                val photoFile = createFile(outputDirectory, FILENAME, PHOTO_EXTENSION)
+                val photoFile = createFile(outputDirectory, FILENAME, lightValue,  PHOTO_EXTENSION)
 
                 // Setup image capture metadata
                 val metadata = Metadata().apply {
@@ -575,103 +601,8 @@ class CameraFragment : Fragment() {
             Navigation.findNavController(
                 requireActivity(), R.id.fragment_container
             ).navigate(CameraFragmentDirections.actionCameraToPreference())
-
-            Log.d(TAG, "Finish setonclicklistener")
+            observeCameraPreference()
         }
-
-//            AlertDialog.Builder(requireContext())
-//                .setView(R.layout.fragment_preference)
-//                .show()
-//                .also{ alertDialog ->
-//                    if(alertDialog==null){
-//                        return@also
-//                    }
-//
-//                    val brightRadioGroup = alertDialog.findViewById<RadioGroup>(R.id.radioGroupBright)
-//                    val zoomRadioGroup = alertDialog.findViewById<RadioGroup>(R.id.radioGroupZoom)
-//                    val resolutionRadioGroup = alertDialog.findViewById<RadioGroup>(R.id.radioGroupResolution)
-//
-//                    brightRadioGroup?.setOnCheckedChangeListener { _, checkedId ->
-//                        when(checkedId) {
-//                            R.id.radioBtnBright1 -> {
-//                                camera!!.cameraInfo.let{camera!!.cameraControl?.setExposureCompensationIndex(-2)}
-//                                val currentCameraPreference = CameraPreference().apply{
-//                                    exposure = 1
-//                                }
-//                                sharedManager.saveCurrentCameraPreference(currentCameraPreference)
-//                                Log.d(TAG,"Set exposure compensation index -2")
-//                            }
-//                            R.id.radioBtnBright2 -> {
-//                                camera!!.cameraInfo.let{camera!!.cameraControl?.setExposureCompensationIndex(-1)}
-//                                val currentCameraPreference = CameraPreference().apply{
-//                                    exposure = 2
-//                                }
-//                                sharedManager.saveCurrentCameraPreference(currentCameraPreference)
-//                                Log.d(TAG,"Set exposure compensation index -1")
-//                            }
-//                            R.id.radioBtnBright3 -> {
-//                                camera!!.cameraInfo.let{camera!!.cameraControl?.setExposureCompensationIndex(0)}
-//                                val currentCameraPreference = CameraPreference().apply{
-//                                    exposure = 3
-//                                }
-//                                sharedManager.saveCurrentCameraPreference(currentCameraPreference)
-//                                Log.d(TAG,"Set exposure compensation index 0")
-//                            }
-//                            R.id.radioBtnBright4 -> {
-//                                camera!!.cameraInfo.let{camera!!.cameraControl?.setExposureCompensationIndex(1)}
-//                                val currentCameraPreference = CameraPreference().apply{
-//                                    exposure = 4
-//                                }
-//                                sharedManager.saveCurrentCameraPreference(currentCameraPreference)
-//                                Log.d(TAG,"Set exposure compensation index 1")
-//                            }
-//                            R.id.radioBtnBright5 -> {
-//                                camera!!.cameraInfo.let{camera!!.cameraControl?.setExposureCompensationIndex(2)}
-//                                val currentCameraPreference = CameraPreference().apply{
-//                                    exposure = 5
-//                                }
-//                                sharedManager.saveCurrentCameraPreference(currentCameraPreference)
-//                                Log.d(TAG,"Set exposure compensation index 2")
-//                            }
-//                        }
-//                    }
-//
-//                    zoomRadioGroup?.setOnCheckedChangeListener { _, checkedId ->
-//                        when(checkedId) {
-//                            R.id.radioBtnZoom1 -> {
-//                                camera!!.cameraControl?.setZoomRatio(1F)
-//                                Log.d(TAG,"Set zoom ratio x1")
-//                            }
-//                            R.id.radioBtnZoom2 -> {
-//                                camera!!.cameraControl?.setZoomRatio(2F)
-//                                Log.d(TAG,"Set zoom ratio x2")
-//                            }
-//                            R.id.radioBtnZoom3 -> {
-//                                camera!!.cameraControl?.setZoomRatio(5F)
-//                                Log.d(TAG,"Set zoom ratio x5")
-//                            }
-//                        }
-//                    }
-//
-//                    resolutionRadioGroup?.setOnCheckedChangeListener { _, checkedId ->
-//                        when(checkedId) {
-//                            R.id.radioBtnResolution1 -> {
-//                                cameraSizeWidth = 1080
-//                                cameraSizeHeight = 1920
-//                            }
-//                            R.id.radioBtnResolution2 -> {
-//                                cameraSizeWidth = 720
-//                                cameraSizeHeight = 1280
-//                            }
-//                            R.id.radioBtnResolution3 -> {
-//                                cameraSizeWidth = 480
-//                                cameraSizeHeight = 640
-//                            }
-//                        }
-//                        bindCameraUseCases()
-//                    }
-//                }
-//           }
 
         // Listener for button used to view the most recent photo
         cameraUiContainerBinding?.photoViewButton?.setOnClickListener {
@@ -683,6 +614,50 @@ class CameraFragment : Fragment() {
                         .actionCameraToGallery(outputDirectory.absolutePath))
             }
         }
+    }
+
+    private fun observeCameraPreference() {
+        var _exposure: Int = 0
+        var _zoom: Float = 0F
+
+        MainApplication.getInstance().getDataStore().cameraExposureFlow.asLiveData()
+            .observe(viewLifecycleOwner) { exposure ->
+                Log.d(TAG, "exposure changed: $exposure")
+                _exposure = exposure
+            }
+
+        MainApplication.getInstance().getDataStore().cameraZoomFlow.asLiveData()
+            .observe(viewLifecycleOwner) { zoom ->
+                Log.d(TAG, "zoom changed: $zoom")
+                _zoom = zoom
+            }
+
+        MainApplication.getInstance().getDataStore().cameraResolutionFlow.asLiveData()
+            .observe(viewLifecycleOwner) { resolution ->
+                when (resolution) {
+                    1080 -> {
+                        cameraSizeWidth = 1080
+                        cameraSizeHeight = 1920
+                    }
+                    720 -> {
+                        cameraSizeWidth = 720
+                        cameraSizeHeight = 1280
+                    }
+                    480 -> {
+                        cameraSizeWidth = 480
+                        cameraSizeHeight = 640
+                    }
+                }
+            }
+
+        MainApplication.getInstance().getDataStore().cameraSettingFlow.asLiveData()
+            .observe(viewLifecycleOwner) { changeType ->
+                when (changeType) {
+                    "exposure" -> { camera!!.cameraInfo.let { camera!!.cameraControl?.setExposureCompensationIndex(_exposure) } }
+                    "zoom" -> { camera!!.cameraControl?.setZoomRatio(_zoom) }
+                    "resolution" -> {bindCameraUseCases()}
+                }
+            }
     }
 
     /** Enabled or disabled a button to switch cameras depending on the available cameras */
@@ -791,17 +766,26 @@ class CameraFragment : Fragment() {
         }
     }
 
+    override fun onSensorChanged(event: SensorEvent) {
+        lightValue = event.values[0]
+    }
+
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
+
+    }
+
     companion object {
 
         private const val TAG = "CameraXBasic"
-        private const val FILENAME = "yyyy-MM-dd-HH-mm-ss-SSS"
+        private const val FILENAME = "yyyy-MM-dd-HH-mm-ss-SSS-"
         private const val PHOTO_EXTENSION = ".jpg"
         private const val RATIO_4_3_VALUE = 4.0 / 3.0
         private const val RATIO_16_9_VALUE = 16.0 / 9.0
 
         /** Helper function used to create a timestamped file */
-        private fun createFile(baseFolder: File, format: String, extension: String) =
+        private fun createFile(baseFolder: File, format: String, lightvalue: Float,extension: String) =
                 File(baseFolder, SimpleDateFormat(format, Locale.US)
-                        .format(System.currentTimeMillis()) + extension)
+                        .format(System.currentTimeMillis()) + lightvalue + extension)
     }
 }
